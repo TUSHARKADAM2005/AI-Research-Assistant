@@ -12,16 +12,64 @@ import random
 import re
 import concurrent.futures
 
-# --- CONFIGURATION ---
-# PASTE YOUR GOOGLE KEY HERE
-# --- CONFIGURATION ---
-# PASTE YOUR GOOGLE KEY HERE
-GOOGLE_API_KEY = "AIzaSyAoYcwgWJRVnnA9Eg1Ww6qEZmCcfguq5GU"
+# --- CONFIGURATION & KEY MANAGEMENT ---
+API_KEYS = []
+try:
+    # Method 1: Load a specific list if defined in secrets
+    if "GOOGLE_API_KEYS" in st.secrets:
+        # Assuming keys are stored as a list or comma-separated string in secrets
+        if isinstance(st.secrets["GOOGLE_API_KEYS"], list):
+             API_KEYS = st.secrets["GOOGLE_API_KEYS"]
+        else:
+             API_KEYS = [k.strip() for k in st.secrets["GOOGLE_API_KEYS"].split(',')]
+    
+    # Method 2: Load individual keys (GOOGLE_API_KEY, GOOGLE_API_KEY_2, etc.)
+    else:
+        # Check for the primary key
+        if "GOOGLE_API_KEY" in st.secrets:
+            API_KEYS.append(st.secrets["GOOGLE_API_KEY"])
+        
+        # Check for additional keys pattern GOOGLE_API_KEY_2, _3, etc.
+        i = 2
+        while f"GOOGLE_API_KEY_{i}" in st.secrets:
+            API_KEYS.append(st.secrets[f"GOOGLE_API_KEY_{i}"])
+            i += 1
+
+    if not API_KEYS:
+        raise KeyError("No keys found")
+
+except (FileNotFoundError, KeyError):
+    st.error("🚨 Configuration Error: No GOOGLE_API_KEYs found in secrets.")
+    st.info("Please create a .streamlit/secrets.toml file with GOOGLE_API_KEY (or a list of keys).")
+    st.stop()
+
+# Helper to cycle keys
+if "key_index" not in st.session_state:
+    st.session_state.key_index = 0
+
+def get_current_key():
+    # Safe getter that defaults to 0 if session_state is inaccessible (threading)
+    try:
+        if "key_index" in st.session_state:
+            return API_KEYS[st.session_state.key_index % len(API_KEYS)]
+    except:
+        pass
+    return API_KEYS[0]
+
+def rotate_key():
+    # Safe rotator that fails silently if session_state is inaccessible (threading)
+    try:
+        st.session_state.key_index = (st.session_state.key_index + 1) % len(API_KEYS)
+    except:
+        pass 
 
 # --- SMART ENGINE ---
 def get_working_model():
-    if "PASTE_YOUR" in GOOGLE_API_KEY: return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
+    # Try current key first
+    current_key = get_current_key()
+    if "PASTE_YOUR" in current_key: return None
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={current_key}"
     try:
         response = requests.get(url, timeout=3)
         if response.status_code == 200:
@@ -30,31 +78,85 @@ def get_working_model():
                     if 'flash' in model['name']: return model['name']
             return "models/gemini-pro"
     except:
-        return "models/gemini-1.5-flash"
+        pass
+    return "models/gemini-1.5-flash" # Fallback default
 
 if "active_model" not in st.session_state:
     st.session_state.active_model = get_working_model()
 
 def call_google_ai_direct(prompt, model_name=None):
     if model_name is None:
-        if "active_model" in st.session_state:
-            model_name = st.session_state.active_model
-        else:
-            return "❌ Error: Model not initialized."
+        # Safely access model name or default
+        try:
+             model_name = st.session_state.active_model
+        except:
+             model_name = "models/gemini-1.5-flash"
     
     clean_model_name = model_name.replace("models/models/", "models/")
-    url = f"https://generativelanguage.googleapis.com/v1beta/{clean_model_name}:generateContent?key={GOOGLE_API_KEY}"
-    headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
+    
+    # --- THREAD-SAFE KEY MANAGEMENT ---
+    # Instead of relying on st.session_state (which fails in threads),
+    # we determine a starting index safely and rotate LOCALLY within this function.
+    start_index = 0
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        if response.status_code == 200:
-            return response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            return f"Error {response.status_code}: {response.text}"
-    except Exception as e:
-        return f"Network Error: {str(e)}"
+        if "key_index" in st.session_state:
+            start_index = st.session_state.key_index
+    except:
+        pass # We are in a thread, st.session_state is missing. Default to 0.
+
+    # Allow cycling through keys twice
+    max_retries = len(API_KEYS) * 2 
+    base_delay = 1
+    
+    for attempt in range(max_retries):
+        # Calculate key locally: (start + attempt) % total
+        current_key_index = (start_index + attempt) % len(API_KEYS)
+        current_key = API_KEYS[current_key_index]
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/{clean_model_name}:generateContent?key={current_key}"
+        headers = {"Content-Type": "application/json"}
+        
+        # Payload with safety settings to prevent blocks
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+            ]
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
+            
+            if response.status_code == 200:
+                response_json = response.json()
+                if "candidates" in response_json and response_json["candidates"]:
+                    if "content" in response_json["candidates"][0]:
+                        return response_json["candidates"][0]["content"]["parts"][0]["text"]
+                    else:
+                        return "⚠️ Content blocked by filters."
+                else:
+                    return "⚠️ No candidates returned."
+            
+            elif response.status_code in [429, 500, 503]: 
+                # Attempt to update global state if possible (main thread), otherwise ignore
+                rotate_key() 
+                
+                wait_time = min(base_delay * (2 ** attempt), 10)
+                time.sleep(wait_time)
+                continue # The loop will naturally pick the NEXT key via (start + attempt)
+                
+            else:
+                return f"Error {response.status_code}: {response.text}"
+                
+        except Exception as e:
+            rotate_key()
+            time.sleep(1)
+            continue
+            
+    return "❌ Failed to generate content after exhausting all keys."
 
 # --- HELPER: STRIP HTML ---
 def strip_html(text):
@@ -111,23 +213,25 @@ def generate_simulation_data(topic):
     ]
 
 def Agent_Researcher(topic, log_container):
-    log_container.info(f"🕵️ Researcher: Scanning ArXiv for '{topic}'...")
+    log_container.info(f"🕵️ Researcher: Scanning ArXiv for '{topic}' (2022-2025)...")
     try:
-        client = arxiv.Client(page_size=5, delay_seconds=3, num_retries=1)
-        search = arxiv.Search(query=f"{topic}", max_results=5, sort_by=arxiv.SortCriterion.Relevance)
+        client = arxiv.Client(page_size=20, delay_seconds=3, num_retries=1)
+        search = arxiv.Search(query=f"{topic}", max_results=30, sort_by=arxiv.SortCriterion.Relevance)
         results = []
+        
         for r in client.results(search):
-            results.append({
-                "title": r.title, 
-                "summary": r.summary.replace('\n', ' '), 
-                "published": r.published.year, 
-                "authors": [a.name for a in r.authors], 
-                "link": r.entry_id
-            })
+            if 2022 <= r.published.year <= 2025:
+                results.append({
+                    "title": r.title, 
+                    "summary": r.summary.replace('\n', ' '), 
+                    "published": r.published.year, 
+                    "authors": [a.name for a in r.authors], 
+                    "link": r.entry_id
+                })
             if len(results) >= 5: break
         
         if not results: raise Exception("Empty Results")
-        log_container.success(f"✅ Found {len(results)} relevant papers.")
+        log_container.success(f"✅ Found {len(results)} relevant papers from 2022-2025.")
         return results
 
     except Exception as e:
@@ -178,6 +282,18 @@ def Agent_Analyst(papers, log_container):
     return insight_text, fig
 
 def format_single_paper(p, model_name):
+    authors_list = p['authors']
+    if len(authors_list) == 1:
+        apa_authors = authors_list[0]
+    elif len(authors_list) == 2:
+        apa_authors = f"{authors_list[0]} & {authors_list[1]}"
+    else:
+        apa_authors = ", ".join(authors_list[:3])
+        if len(authors_list) > 3:
+            apa_authors += ", et al"
+    
+    apa_citation = f"{apa_authors}. ({p['published']}). {p['title']}. <i>arXiv</i>."
+
     prompt = f"""
     Analyze this research paper.
     Title: {p['title']}
@@ -188,7 +304,7 @@ def format_single_paper(p, model_name):
     1. Output result as raw HTML (No Markdown).
     2. Structure:
        - <h3 class='paper-title'>{p['title']}</h3>
-       - <div class='paper-meta'><b>CITATION:</b> {p['authors'][0]} et al. ({p['published']})</div>
+       - <div class='paper-meta'><b>APA CITATION:</b> {apa_citation}</div>
        - <div class='paper-section'><b>SUMMARY:</b> [Concise summary]</div>
        - <div class='paper-section'><b>KEY HIGHLIGHTS:</b> <ul><li>[Point 1]</li><li>[Point 2]</li><li>[Point 3]</li></ul></div>
        
@@ -206,6 +322,8 @@ def format_single_paper(p, model_name):
        </div>
     """
     response_text = call_google_ai_direct(prompt, model_name=model_name)
+    if "⚠️" in response_text or "❌" in response_text:
+         return f"<div style='color:red;'><b>AI Generation Error:</b> {response_text}</div>"
     return response_text.replace("```html", "").replace("```", "")
 
 def Agent_Formatter(papers, log_container):
@@ -213,11 +331,14 @@ def Agent_Formatter(papers, log_container):
     formatted_data = []
     current_model = st.session_state.active_model
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(format_single_paper, p, current_model) for p in papers[:5]]
         for future in concurrent.futures.as_completed(futures):
-            try: formatted_data.append(future.result())
-            except: formatted_data.append("Error processing paper.")
+            try: 
+                result = future.result()
+                formatted_data.append(result)
+            except Exception as e: 
+                formatted_data.append(f"<b>System Error:</b> {str(e)}")
 
     log_container.success("✅ Parallel Formatting Complete.")
     return formatted_data
@@ -328,7 +449,7 @@ def Agent_Root_Manager():
 
     with st.sidebar:
         st.title("🤖 AI Research Manager")
-        st.caption("v7.0 | Enhanced UI Edition")
+        st.caption("v7.2 | Multi-Key Tushar Kadam")
         st.divider()
         
         history = archivist.load_history()
